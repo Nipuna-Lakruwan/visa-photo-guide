@@ -1,0 +1,129 @@
+import {profiles,checkedDate} from './profiles.mjs';
+import {clamp,frame,toFrame,toSource,corners,fitFrame,measurements} from './geometry.mjs';
+const $=id=>document.getElementById(id), source=$('source'), sc=source.getContext('2d'), preview=$('preview'), pc=preview.getContext('2d');
+let profile=profiles[0],image=null,file=null,f=null,marks={},markMode=null,guided=false,drag=null,decoded=null,exportBlob=null,exportURL=null,exportInfo=null,generation=0,timer=null,lastResult=null,loadRevision=0;
+const pairIds=['zoom','x','y','angle','quality'];
+const colours={crown:'#15806f',chin:'#bd6c28',center:'#4c70c6'};
+function illustration(kind='all'){
+ const point=(k,x,y,label)=>`<circle cx="${x}" cy="${y}" r="6" fill="${colours[k]}"/><path d="M${x+8} ${y}H145" stroke="${colours[k]}" stroke-width="2"/><text x="148" y="${y+4}" fill="${colours[k]}" font-size="10">${label}</text>`;
+ return `<svg viewBox="0 0 210 250" role="img" aria-label="Diagram showing crown, chin and midpoint between the eyes"><rect x="1" y="1" width="208" height="248" rx="12" fill="#e9efe3"/><path d="M25 240Q25 192 76 188L76 168H114V188Q155 192 155 240" fill="#829b88"/><ellipse cx="95" cy="106" rx="47" ry="71" fill="#dac3a1"/><path d="M49 95Q34 23 94 27Q154 22 141 95L125 63Q88 70 64 58Z" fill="#385d4e"/><circle cx="77" cy="102" r="4" fill="#385547"/><circle cx="112" cy="102" r="4" fill="#385547"/><path d="M95 110L91 126H99M80 145Q96 150 111 145" fill="none" stroke="#9e7a5c" stroke-width="2"/>${kind==='all'||kind==='crown'?point('crown',95,31,'TOP'):''}${kind==='all'||kind==='chin'?point('chin',95,176,'CHIN'):''}${kind==='all'||kind==='center'?point('center',95,102,'EYES'):''}</svg>`;
+}
+$('illustration').innerHTML=illustration();$('helpArt').innerHTML=illustration();
+const countries=[...new Set(profiles.map(p=>p.country))].sort();
+for(const country of countries){const opt=new Option(country,country);$('country').add(opt)}
+$('country').value=profile.country;
+function setProfile(p){
+ profile=p;markMode=null;guided=false;$('downloadStatus').textContent='';$('document').replaceChildren(...profiles.filter(q=>q.country===p.country).map(q=>new Option(q.document,q.id)));$('document').value=p.id;
+ $('specSize').textContent=p.digital?(p.id==='uk-digital'?'Original file':`Square JPEG`):`${p.w} × ${p.h} mm`;
+ $('specHint').textContent=p.originalOnly?'Original-preserving reference mode':p.print?'Print dimensions · read paper requirements':'Digital export · live measurements';
+ $('pixels').value=p.px;$('pixels').min=p.minPx||100;$('pixels').max=p.maxPx||2400;$('limit').value=p.maxKB||'';
+ $('rulesTitle').textContent=p.country+' · '+p.document;$('backgroundRule').textContent='Background: '+p.background;
+ $('ruleList').replaceChildren(...p.rules.map(t=>{const li=document.createElement('li');li.textContent=t;return li}));
+ $('reviewed').textContent='Official sources reviewed '+checkedDate+'. Requirements can change; check your actual application.';
+ $('officialSource').href=p.source;$('extraSource').hidden=!p.extra;if(p.extra)$('extraSource').href=p.extra;
+ $('checker').href=p.check||p.application||p.source;$('checker').textContent=p.checkLabel+' ↗';$('checkerNote').textContent=p.checkNote;
+ $('referenceNotice').hidden=!p.originalOnly;$('referenceNotice').textContent=p.id==='uk-digital'?'UK digital passport: do not crop your own-device photo. These controls are a reference preview only; download preserves the original.':'Canada passport: studio photos must remain unaltered. This is a reference preview; download preserves the original file.';
+ $('download').textContent=p.originalOnly?'Download unchanged original':'Download JPEG';
+ $('exportControls').disabled=!image||!!p.originalOnly;
+ clearChecks();setStep();if(image){f=frame(image.width,image.height,p.w/p.h);syncControls();draw()}else{emptyPreview();updateDimensions()}
+}
+$('country').onchange=()=>setProfile(profiles.find(p=>p.country===$('country').value));$('document').onchange=()=>setProfile(profiles.find(p=>p.id===$('document').value));
+$('rulesOpen').onclick=()=>{$('rules').scrollIntoView({behavior:'smooth',block:'start'});};
+$('helpOpen').onclick=()=>$('helpDialog').showModal();$('helpClose').onclick=()=>$('helpDialog').close();$('inspectClose').onclick=()=>$('inspectDialog').close();
+for(const d of [$('helpDialog'),$('inspectDialog')])d.addEventListener('click',e=>{if(e.target===d){const b=d.getBoundingClientRect();if(e.clientX<b.left||e.clientX>b.right||e.clientY<b.top||e.clientY>b.bottom)d.close()}});
+function clearChecks(){document.querySelectorAll('.checklist input').forEach(el=>el.checked=false)}
+function enable(yes){$('remove').disabled=!yes;$('guided').disabled=!yes;$('reset').disabled=!yes;$('editControls').disabled=!yes;$('exportControls').disabled=!yes||!!profile.originalOnly;for(const k of ['crownY','chinY','centreX'])$(k).disabled=!yes;document.querySelectorAll('[data-mark]').forEach(el=>el.disabled=!yes);$('empty').hidden=yes;$('miniWrap').hidden=!yes;}
+const choose=()=>$('file').click();$('choose').onclick=choose;$('emptyChoose').onclick=choose;
+$('file').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0]);};
+for(const type of ['dragenter','dragover'])$('dropzone').addEventListener(type,e=>{e.preventDefault();$('dropzone').classList.add('drag-over')});
+for(const type of ['dragleave','drop'])$('dropzone').addEventListener(type,e=>{e.preventDefault();$('dropzone').classList.remove('drag-over');if(type==='drop'&&e.dataTransfer.files[0])loadFile(e.dataTransfer.files[0])});
+async function loadFile(nextFile){
+ const load=++loadRevision;
+ try{
+  if(!['image/jpeg','image/png','image/webp'].includes(nextFile.type))throw new Error('Please choose a JPEG, PNG or WebP. For HEIC, export an original JPEG from your photo app first.');
+  if(nextFile.size>25e6)throw new Error('Please choose a file smaller than 25 MB.');
+  const url=URL.createObjectURL(nextFile),next=new Image();try{next.src=url;await next.decode()}finally{URL.revokeObjectURL(url)}
+  if(next.width*next.height>40e6)throw new Error('This image is too large for the workspace. Choose one up to 40 megapixels.');
+  if(next.width<100||next.height<100)throw new Error('This image is too small. Choose a clear original at least 100 pixels on each side.');
+  // Transparency must not silently become a black or replacement background on JPEG export.
+  if(nextFile.type!=='image/jpeg'){
+   const check=document.createElement('canvas');check.width=next.width;check.height=next.height;const cx=check.getContext('2d',{willReadFrequently:true});cx.drawImage(next,0,0);const pixels=cx.getImageData(0,0,check.width,check.height).data;
+   for(let i=3;i<pixels.length;i+=4)if(pixels[i]!==255)throw new Error('This image has transparency. Use the opaque original studio photo; this tool will not add a background.');
+   check.width=check.height=0;
+  }
+  if(load!==loadRevision)return;
+  image=next;file=nextFile;marks={};markMode=null;guided=false;decoded=null;lastResult=null;f=frame(image.width,image.height,profile.w/profile.h);generation++;clearChecks();enable(true);syncControls();$('fileInfo').textContent=nextFile.name+' · '+next.width+' × '+next.height+' px · '+(nextFile.size/1000).toFixed(1)+' KB · kept locally';$('fitMessage').textContent='Start with “Help me mark” for step-by-step instructions, or mark the three points yourself.';$('downloadStatus').textContent='';setStep();draw();
+ }catch(error){if(load!==loadRevision)return;$('downloadStatus').textContent=error.message;$('downloadStatus').className='small warn';$('file').value='';}
+}
+function discard(){loadRevision++;generation++;clearTimeout(timer);image=file=f=decoded=exportBlob=lastResult=null;if($('inspectDialog').open)$('inspectDialog').close();marks={};drag=null;markMode=null;guided=false;if(exportURL)URL.revokeObjectURL(exportURL);exportURL=null;$('actualImage').removeAttribute('src');$('file').value='';enable(false);$('fit').disabled=true;$('inspect').disabled=$('download').disabled=$('report').disabled=true;document.querySelectorAll('[data-mark]').forEach(b=>b.classList.remove('done','active'));for(const k of ['crownY','chinY','centreX'])$(k).value='';$('measurements').textContent='Choose a photo and mark three points to see measurements.';$('fileInfo').textContent='JPEG, PNG or WebP · up to 25 MB · photos never leave this browser';$('fitMessage').textContent='Measurements depend on your markings. No AI is used.';$('downloadStatus').textContent='';$('exportInfo').textContent='Choose a photo to begin.';$('previewCaption').textContent='Your export preview appears here.';clearChecks();setStep();drawSource();emptyPreview();}
+$('remove').onclick=discard;
+function view(){if(!image)return null;const scale=Math.min(744/image.width,794/image.height);return {scale,x:(800-image.width*scale)/2,y:(850-image.height*scale)/2};}
+function pointFromEvent(e){const r=source.getBoundingClientRect(),v=view(),x=(e.clientX-r.left)*800/r.width,y=(e.clientY-r.top)*850/r.height;return {x:clamp((x-v.x)/v.scale,0,image.width),y:clamp((y-v.y)/v.scale,0,image.height)};}
+function drawSource(){sc.clearRect(0,0,800,850);sc.fillStyle='#e9ede6';sc.fillRect(0,0,800,850);if(!image)return;const v=view(),sp=p=>({x:v.x+p.x*v.scale,y:v.y+p.y*v.scale});sc.drawImage(image,v.x,v.y,image.width*v.scale,image.height*v.scale);
+ const cs=corners(f).map(sp);sc.save();sc.beginPath();sc.rect(v.x,v.y,image.width*v.scale,image.height*v.scale);sc.moveTo(cs[0].x,cs[0].y);for(let i=3;i>=0;i--)sc.lineTo(cs[i].x,cs[i].y);sc.closePath();sc.fillStyle='#14312866';sc.fill('evenodd');sc.beginPath();cs.forEach((p,i)=>i?sc.lineTo(p.x,p.y):sc.moveTo(p.x,p.y));sc.closePath();sc.strokeStyle='#ecfff0';sc.lineWidth=3;sc.stroke();
+ if($('guides').checked){sc.setLineDash([8,7]);sc.lineWidth=1.5;sc.strokeStyle='#e7fff0cc';for(const n of [1/3,2/3]){const a=sp(toSource({x:n,y:0},f)),b=sp(toSource({x:n,y:1},f));sc.beginPath();sc.moveTo(a.x,a.y);sc.lineTo(b.x,b.y);sc.stroke();}sc.setLineDash([])}
+ for(const [key,q] of Object.entries(marks)){const p=sp(q);sc.fillStyle=colours[key];sc.strokeStyle='#fff';sc.lineWidth=3;sc.beginPath();sc.arc(p.x,p.y,10,0,Math.PI*2);sc.fill();sc.stroke();sc.font='600 16px system-ui';const text={crown:'1 · TOP',chin:'2 · CHIN',center:'3 · EYES'}[key];const tx=clamp(p.x+16,8,670),ty=Math.max(20,p.y-12);sc.lineWidth=4;sc.strokeText(text,tx,ty);sc.fillText(text,tx,ty)}sc.restore();}
+function paint(target,img,width,height,guide=false){const c=target.getContext('2d');target.width=width;target.height=height;c.save();c.translate(width/2,height/2);c.scale(width/f.w,height/f.h);c.rotate(f.angle*Math.PI/180);c.translate(-f.cx,-f.cy);c.drawImage(img,0,0);c.restore();if(guide)paintGuides(c,width,height);}
+function paintGuides(c,w,h){if(!$('guides').checked)return;c.save();c.lineWidth=Math.max(1,w/400);c.setLineDash([w/55,w/70]);c.strokeStyle='#36a183';c.beginPath();c.moveTo(w/2,0);c.lineTo(w/2,h);c.stroke();for(const k of ['crown','chin'])if(marks[k]){const p=toFrame(marks[k],f);c.strokeStyle=colours[k];c.beginPath();c.moveTo(0,p.y*h);c.lineTo(w,p.y*h);c.stroke()}c.restore();}
+function updateMini(){const mini=$('mini');mini.width=preview.width;mini.height=preview.height;mini.getContext('2d').drawImage(preview,0,0);}
+function paintPreview(){if(!image)return;const w=420,h=Math.round(w*(profile.originalOnly?(decoded||image).height/(decoded||image).width:profile.h/profile.w));preview.width=w;preview.height=h;if(profile.originalOnly){pc.drawImage(decoded||image,0,0,w,h);updateMini();return;}if(decoded){pc.drawImage(decoded,0,0,w,h);if(!profile.originalOnly)paintGuides(pc,w,h)}else paint(preview,image,w,h,true);updateMini();}
+function emptyPreview(){preview.width=420;preview.height=Math.round(420*profile.h/profile.w);pc.fillStyle='#e2e8db';pc.fillRect(0,0,preview.width,preview.height);}
+function rangeStatus(v,a,b){return v!==null&&v>=a-1e-7&&v<=b+1e-7;}
+function row(name,text,ok=null){const d=document.createElement('div');d.className='measure-row';const span=document.createElement('span');span.textContent=name;const strong=document.createElement('strong');strong.textContent=text;strong.className=ok===null?'muted':ok?'pass':'warn';d.append(span,strong);return d;}
+function updateMeasurements(){const m=measurements(f,marks,profile),rows=[];
+ if(profile.head){rows.push(row('Head height',m.head===null?'Mark top & chin':m.head.toFixed(1)+' mm · '+(rangeStatus(m.head,...profile.head)?'in range':'review'),m.head===null?null:rangeStatus(m.head,...profile.head)))}else if(profile.headPercent){rows.push(row('Head height',m.percent===null?'Mark top & chin':m.percent.toFixed(1)+'% · '+(rangeStatus(m.percent,...profile.headPercent)?'in range':'review'),m.percent===null?null:rangeStatus(m.percent,...profile.headPercent)))}else rows.push(row('Head height',m.percent===null?'Mark top & chin':m.percent.toFixed(1)+'% · information only'));
+ if(profile.top)rows.push(row('Top margin',m.top===null?'Mark top':m.top.toFixed(1)+' mm',m.top===null?null:rangeStatus(m.top,...profile.top)));
+ if(profile.bottom)rows.push(row('Chin to bottom',m.bottom===null?'Mark chin':m.bottom.toFixed(1)+' mm',m.bottom===null?null:rangeStatus(m.bottom,...profile.bottom)));
+ rows.push(row('Horizontal face offset',m.offset===null?'Mark between eyes':m.offset.toFixed(1)+'% · visual guide',m.offset===null?null:m.offset<=2));
+ rows.push(row('Source boundaries','No added background',true));if(Object.keys(marks).length)rows.push(row('Marked points in frame',m.inside?'All visible':'Some points cropped',m.inside));
+ if($('pixels').value>f.w+1&&!profile.originalOnly)rows.push(row('Source resolution','Upscaling · inspect sharpness',false));
+ $('measurements').replaceChildren(...rows);$('fit').disabled=!(marks.crown&&marks.chin&&marks.center);for(const [id,k,axis,dim] of [['crownY','crown','y',image.height],['chinY','chin','y',image.height],['centreX','center','x',image.width]])if(document.activeElement!==$(id))$(id).value=marks[k]?(marks[k][axis]/dim*100).toFixed(2):'';
+ document.querySelectorAll('[data-mark]').forEach(b=>{b.classList.toggle('done',!!marks[b.dataset.mark]);b.classList.toggle('active',b.dataset.mark===markMode)});return m;
+}
+function syncControls(){if(!f)return;const values={zoom:f.zoom*100,x:f.cx/image.width*100,y:f.cy/image.height*100,angle:f.angle};$('zoom').max=$('zoomNum').max=Math.max(600,Math.ceil(values.zoom));for(const [k,v]of Object.entries(values)){const n=k==='zoom'?Math.round(v):Number(v.toFixed(1));$(k).value=n;$(k+'Num').value=n}}
+function updateDimensions(){const w=clamp(Math.round(+$('pixels').value||profile.px),profile.minPx||100,profile.maxPx||2400),h=Math.round(w*profile.h/profile.w);$('heightHint').textContent=profile.originalOnly?'Original pixel dimensions and file bytes are preserved.':w+' × '+h+' px'+(profile.digital?'':` · ${profile.w} × ${profile.h} mm`);return {w,h};}
+function draw(){if(!image)return;$('fitMessage').textContent='Live measurements updated. Review the current crop or fit it using your markings.';decoded=null;lastResult=null;drawSource();paintPreview();updateMeasurements();updateDimensions();scheduleExport();}
+function scheduleExport(){generation++;clearTimeout(timer);exportBlob=null;$('download').disabled=true;$('inspect').disabled=true;$('report').disabled=true;$('exportInfo').textContent='Updating the actual export…';$('previewCaption').textContent='Live framing preview · encoding JPEG…';timer=setTimeout(()=>prepareExport(generation),120);}
+function setStep(){const title={crown:'1 / Click the top of the head',chin:'2 / Click the bottom of the chin',center:'3 / Click midway between the eyes'};const text={crown:'Click '+profile.crown+'. Follow this country’s definition; do not use the forehead or hairline.',chin:'Click the lowest central point of the chin—not the neck or the collar.',center:'Click halfway between the pupils. We use this point to centre the face horizontally.'};$('stepTitle').textContent=markMode?title[markMode]:'No technical knowledge needed.';$('stepText').textContent=markMode?text[markMode]:'Use “Help me mark” to place all three points one at a time. Coloured dots can be dragged to correct them.';$('illustration').innerHTML=illustration(markMode||'all');$('cancelMark').hidden=!markMode;source.style.cursor=markMode?'crosshair':'grab';document.querySelectorAll('[data-mark]').forEach(b=>b.classList.toggle('active',b.dataset.mark===markMode));}
+function beginMark(key,walk=false){markMode=key;guided=walk;setStep();source.focus({preventScroll:true});}
+for(const b of document.querySelectorAll('[data-mark]'))b.onclick=()=>beginMark(b.dataset.mark);
+$('guided').onclick=()=>beginMark('crown',true);$('cancelMark').onclick=()=>{markMode=null;guided=false;setStep()};
+function setMark(key,p){marks[key]={x:p.x,y:p.y};if(guided){const next={crown:'chin',chin:'center',center:null}[key];markMode=next;if(!next){guided=false;$('fitMessage').textContent='All three points are marked. Click “Fit using my markings”, then review the measurements.'}}else markMode=null;setStep();draw()}
+source.addEventListener('pointerdown',e=>{if(!image)return;e.preventDefault();const p=pointFromEvent(e);if(markMode){setMark(markMode,p);return;}const threshold=18/(view().scale*(source.getBoundingClientRect().width/800));const key=Object.keys(marks).find(k=>Math.hypot(marks[k].x-p.x,marks[k].y-p.y)<threshold);drag={key,start:p,cx:f.cx,cy:f.cy};source.setPointerCapture(e.pointerId);source.style.cursor='grabbing'});
+source.addEventListener('pointermove',e=>{if(!drag||!image)return;const p=pointFromEvent(e);if(drag.key)marks[drag.key]=p;else{f=frame(image.width,image.height,profile.w/profile.h,f.zoom,f.angle,drag.cx+p.x-drag.start.x,drag.cy+p.y-drag.start.y);syncControls()}draw()});
+for(const event of ['pointerup','pointercancel','lostpointercapture'])source.addEventListener(event,()=>{drag=null;source.style.cursor=markMode?'crosshair':'grab'});
+source.addEventListener('keydown',e=>{if(!image||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key))return;e.preventDefault();const step=Math.min(f.w,f.h)*(e.shiftKey?.025:.005);let x=f.cx,y=f.cy;if(e.key==='ArrowLeft')x-=step;if(e.key==='ArrowRight')x+=step;if(e.key==='ArrowUp')y-=step;if(e.key==='ArrowDown')y+=step;f=frame(image.width,image.height,profile.w/profile.h,f.zoom,f.angle,x,y);syncControls();draw()});
+for(const key of pairIds)for(const suffix of ['', 'Num'])$(key+suffix).addEventListener('input',()=>{
+ if(!image)return;const el=$(key+suffix),value=Number(el.value);if(el.value===''||!Number.isFinite(value))return;const lo=+el.min,hi=+el.max,v=clamp(value,lo,hi);$(key).value=v;$(key+'Num').value=v;
+ if(key==='quality'){draw();return;}
+ f=frame(image.width,image.height,profile.w/profile.h,key==='zoom'?v/100:f.zoom,key==='angle'?v:f.angle,key==='x'?v/100*image.width:f.cx,key==='y'?v/100*image.height:f.cy);syncControls();draw();
+});
+$('pixels').oninput=()=>{if(image)draw();else updateDimensions()};$('pixels').onchange=()=>{$('pixels').value=updateDimensions().w;if(image)draw()};$('limit').oninput=()=>{if(image)draw()};$('guides').onchange=()=>{if(image){drawSource();paintPreview()}};
+for(const [id,k,axis]of [['crownY','crown','y'],['chinY','chin','y'],['centreX','center','x']])$(id).addEventListener('input',()=>{if(!image||$(id).value==='')return;const v=clamp(+$(id).value,0,100);marks[k]=marks[k]||{x:image.width/2,y:image.height/2};marks[k][axis]=v/100*(axis==='x'?image.width:image.height);markMode=null;guided=false;setStep();draw()});
+$('fit').onclick=()=>{try{f=fitFrame(image.width,image.height,profile,marks,f.angle);syncControls();draw();const m=measurements(f,marks,profile),good=profile.head?rangeStatus(m.head,...profile.head):profile.headPercent?rangeStatus(m.percent,...profile.headPercent):true;const margin=(!profile.top||rangeStatus(m.top,...profile.top))&&(!profile.bottom||rangeStatus(m.bottom,...profile.bottom));$('fitMessage').textContent=good&&margin?'Fitted from your markings. Review all other requirements before submitting.':'Closest fit using only original pixels. Some measurements remain outside the guide. Try a wider original or retake the photo; no background has been added.';}catch(e){$('fitMessage').textContent=e.message}};
+$('reset').onclick=()=>{f=frame(image.width,image.height,profile.w/profile.h);syncControls();$('fitMessage').textContent='Framing reset. Your measurement markers are retained.';draw()};
+function fixDpi(bytes,dpi){for(let i=2;i<Math.min(bytes.length-16,1024);i++)if(bytes[i]===255&&bytes[i+1]===224&&String.fromCharCode(...bytes.slice(i+4,i+9))==='JFIF\0'){bytes[i+11]=1;for(const j of [12,14]){bytes[i+j]=(dpi>>8)&255;bytes[i+j+1]=dpi&255;}break;}return bytes;}
+async function jpeg(out,q){const blob=await new Promise((resolve,reject)=>out.toBlob(b=>b?resolve(b):reject(new Error('JPEG encoding failed.')),'image/jpeg',q));if(profile.digital)return blob;const dpi=Math.round(out.width/profile.w*25.4);return new Blob([fixDpi(new Uint8Array(await blob.arrayBuffer()),dpi)],{type:'image/jpeg'});}
+async function prepareExport(rev){
+ try{
+ if(!image||rev!==generation)return;let b,q=+$('quality').value/100,adjusted=false;const dims=updateDimensions();
+ if(profile.originalOnly)b=file;
+ else{
+ const out=document.createElement('canvas');paint(out,image,dims.w,dims.h,false);b=await jpeg(out,q);const cap=+$('limit').value*1000;
+ if(cap>0&&b.size>cap){let low=.08,high=q,best=null,bestQ=0;const min=await jpeg(out,low);if(min.size<=cap){best=min;bestQ=low;for(let i=0;i<9;i++){if(rev!==generation)return;const mid=(low+high)/2,candidate=await jpeg(out,mid);if(candidate.size<=cap){best=candidate;bestQ=mid;low=mid}else high=mid}}if(!best){if(rev!==generation)return;$('exportInfo').textContent='Cannot meet this file ceiling at the selected dimensions. Reduce width or increase the limit. Export is disabled.';$('previewCaption').textContent='Framing preview only · no valid export';return;}b=best;q=bestQ;adjusted=true;}
+ }
+ if(rev!==generation)return;
+ const url=URL.createObjectURL(b),actual=new Image();try{actual.src=url;await actual.decode()}catch(e){URL.revokeObjectURL(url);throw e}if(rev!==generation){URL.revokeObjectURL(url);return;}
+ if(exportURL)URL.revokeObjectURL(exportURL);exportURL=url;exportBlob=b;decoded=actual;
+ const actualW=actual.naturalWidth,actualH=actual.naturalHeight,issues=[];
+ if(profile.maxCompression&&actualW*actualH*3/b.size>profile.maxCompression)issues.push('Estimated compression exceeds 20:1. Increase JPEG quality and inspect the official digital requirements.');if(profile.minPx&&actualW<profile.minPx)issues.push('Below the official minimum width.');if(profile.minHeight&&actualH<profile.minHeight)issues.push('Below the official minimum height.');if(profile.maxPx&&actualW>profile.maxPx)issues.push('Above the official maximum pixel width.');if(profile.minKB&&b.size<profile.minKB*1000)issues.push('Below the official minimum file size. Use a larger original or higher quality.');if(profile.maxKB&&b.size>profile.maxKB*1000)issues.push('Exceeds the official file-size maximum.');
+ lastResult={width:actualW,height:actualH,bytes:b.size,quality:q,issues,profile:profile.id,original:!!profile.originalOnly};
+ $('exportInfo').textContent=`${actualW} × ${actualH} px · ${(b.size/1000).toFixed(1)} KB`+(profile.originalOnly?' · Exact original bytes preserved.':` · JPEG ${Math.round(q*100)}%`+(adjusted?' · Quality reduced to meet ceiling.':''))+(issues.length?' '+issues.join(' '):'');$('exportInfo').className='export-info '+(issues.length?'warn':'');
+ $('download').disabled=false;$('inspect').disabled=false;$('report').disabled=false;$('previewCaption').textContent=profile.originalOnly?'Unchanged original · reference crop shown on the workspace':'Actual compressed JPEG · guides excluded from download';paintPreview();
+ }catch(error){if(rev===generation){$('exportInfo').textContent=error.message+' Try another original photo.';$('download').disabled=true;}}
+}
+function save(blob,name){const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),2000)}
+$('download').onclick=()=>{if(!exportBlob)return;save(exportBlob,profile.originalOnly?file.name:`photo-guide-${profile.id}-${lastResult.width}x${lastResult.height}.jpg`);$('downloadStatus').textContent=profile.originalOnly?'Original file downloaded unchanged.':'JPEG downloaded. Inspect it and use the official application or checker.';};
+$('inspect').onclick=()=>{if(!exportURL)return;$('actualImage').src=exportURL;$('inspectDialog').showModal()};
+$('report').onclick=()=>{if(!lastResult)return;const m=measurements(f,marks,profile);const report={application:profile.country+' — '+profile.document,source:profile.source,reviewed:checkedDate,export:lastResult,referenceCrop:{...f,co:undefined,si:undefined},landmarks:marks,measurements:m,notice:'Measurements use manually selected landmarks, not biometric approval. No AI photo edits. No image data is included in this report.'};save(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),`photo-guide-${profile.id}-report.json`)};
+setProfile(profile);enable(false);drawSource();
