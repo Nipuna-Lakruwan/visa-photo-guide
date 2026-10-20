@@ -38,11 +38,11 @@ python3 -m http.server 8766 --bind 127.0.0.1
 Then open http://127.0.0.1:8766 . No build or dependency installation is required.
 
 ```sh
-node --test tests/geometry.test.mjs
+node --test tests/*.test.mjs
 node --check app.mjs
 ```
 
-Tests cover crop boundaries across all profiles, rotations and aspect ratios, coordinate round trips, feasible/infeasible fitting, and original-preserving profile declarations. UI checks additionally cover upload, live controls, country changes, impossible file ceilings, JPEG downloads, byte-identical original downloads, and mobile overflow.
+The 16 automated tests cover crop boundaries across all profiles, rotations and aspect ratios, coordinate round trips, feasible/infeasible fitting, original-file preservation, image-decode races, invalid files, cleared preview buffers, numeric landmark deletion, invalid file ceilings and guidance messages. Application-state tests use a lightweight DOM/canvas model; actual JPEG encoding and rendering are checked separately in a real browser. UI checks additionally cover upload, live controls, country changes, impossible file ceilings, JPEG downloads, byte-identical original downloads, and mobile overflow.
 
 ## Privacy and hosting
 
